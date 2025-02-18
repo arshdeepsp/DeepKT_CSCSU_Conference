@@ -20,15 +20,17 @@ class TransformerBlock(nn.Module):
         self.dropout2 = nn.Dropout(dropout_rate)
 
     def forward(self, x, mask=None):
+        # x: (batch, seq_len, embed_dim) -> transpose for MultiheadAttention: (seq_len, batch, embed_dim)
         x = x.transpose(0, 1)
-        if mask is not None:
-            mask = mask.transpose(0, 1)
+        # NOTE: Do NOT transpose the mask here!
+        # The causal mask from _create_causal_mask already has shape (seq_len, seq_len) in the proper orientation.
         attn_output, _ = self.attention(x, x, x, attn_mask=mask)
         attn_output = self.dropout1(attn_output)
         out1 = self.layernorm1(x + attn_output)
         ffn_output = self.ffn(out1)
         ffn_output = self.dropout2(ffn_output)
         out2 = self.layernorm2(out1 + ffn_output)
+        # Transpose back to (batch, seq_len, embed_dim)
         return out2.transpose(0, 1)
 
 class DKT(nn.Module):
@@ -42,10 +44,11 @@ class DKT(nn.Module):
         self.embed_dim = embed_dim
         self.question_mapping = question_mapping
 
-        # Create separate embeddings for questions and correctness
+        # Separate embeddings for questions and correctness
         self.question_embedding = nn.Embedding(n_questions, embed_dim // 2)
         self.correct_embedding = nn.Embedding(2, embed_dim // 2)
         
+        # Pre-compute positional encodings
         self.register_buffer("pos_encoding", self._positional_encoding(max_seq_len, embed_dim))
         
         self.transformer_blocks = nn.ModuleList([
@@ -65,15 +68,17 @@ class DKT(nn.Module):
         return pos_encoding
 
     def _create_causal_mask(self, size, device):
+        # Create an upper-triangular matrix of ones, then transpose to get a lower-triangular matrix.
         mask = (torch.triu(torch.ones(size, size, device=device)) == 1).transpose(0, 1)
+        # Allowed positions: 0.0; masked positions: -inf.
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
-    def _process_sequence(self, questions, correctness, step_size=32):
+    def _process_sequence(self, questions, correctness):
         batch_size, seq_len = questions.shape
         device = questions.device
         
-        # Get embeddings
+        # Get embeddings and concatenate them.
         q_embeds = self.question_embedding(questions)
         c_embeds = self.correct_embedding(correctness)
         x = torch.cat([q_embeds, c_embeds], dim=-1)
@@ -81,7 +86,7 @@ class DKT(nn.Module):
         # Add positional encoding
         x = x + self.pos_encoding[:seq_len]
         
-        # Create causal mask
+        # Create causal mask of shape (seq_len, seq_len)
         attention_mask = self._create_causal_mask(seq_len, device)
         
         # Process through transformer blocks
@@ -106,7 +111,7 @@ class DKT(nn.Module):
         truth = torch.zeros(batch_size, n_steps, device=device)
         valid_mask = torch.zeros(batch_size, n_steps, device=device)
 
-        # Fill tensors
+        # Fill tensors with data from each record.
         for i, record in enumerate(batch):
             for t in range(min(n_steps, record['n_answers'] - 1)):
                 try:
@@ -137,14 +142,14 @@ class DKT(nn.Module):
                 except Exception as e:
                     continue
 
-        # Get predictions
+        # Get predictions (logits) and apply sigmoid.
         logits = self._process_sequence(questions, correctness)
         pred_output = torch.sigmoid(logits)
         
-        # Gather predictions for next questions
+        # Gather predictions for the "next" question.
         pred = torch.gather(pred_output, 2, next_questions.unsqueeze(-1)).squeeze(-1)
         
-        # Compute loss
+        # Compute binary cross-entropy loss, weighted by valid_mask.
         loss = F.binary_cross_entropy(pred, truth, reduction='none')
         loss = (loss * valid_mask).sum()
         total_tests = valid_mask.sum().item()
@@ -152,7 +157,7 @@ class DKT(nn.Module):
         return loss, total_tests
 
     def predict(self, questions, correctness):
-        """Make predictions for a single sequence"""
+        """Make predictions for a single sequence."""
         self.eval()
         with torch.no_grad():
             logits = self._process_sequence(questions, correctness)
@@ -165,17 +170,16 @@ def evaluate_model(model, test_batch):
         all_preds = []
         all_truths = []
         
-        # Process each sequence individually
+        # Process each sequence individually.
         for record in test_batch:
             seq_len = record['n_answers'] - 1
             if seq_len < 1:
                 continue
             
-            # Prepare sequence data
+            # Prepare sequence data.
             questions = torch.zeros(1, seq_len, dtype=torch.long, device=device)
             correctness = torch.zeros(1, seq_len, dtype=torch.long, device=device)
             
-            # Fill sequence data
             valid_pos = []
             for t in range(seq_len):
                 try:
@@ -198,17 +202,17 @@ def evaluate_model(model, test_batch):
                     questions[0, t] = q_current
                     correctness[0, t] = correct
                     valid_pos.append((t, q_next, record['correct'][t+1]))
-                    
+                
                 except Exception as e:
                     continue
             
             if not valid_pos:
                 continue
             
-            # Get predictions
+            # Get predictions.
             pred_output = model.predict(questions, correctness)
             
-            # Collect predictions
+            # Collect predictions.
             for t, q_next, truth in valid_pos:
                 pred = pred_output[0, t, q_next].item()
                 all_preds.append(pred)
@@ -247,15 +251,15 @@ def collate_fn(batch):
 if __name__ == '__main__':
     from data_assist import DataAssistMatrix
     
-    # Load data
+    # Load data.
     data = DataAssistMatrix()
     train_data = data.getTrainData()
     test_data = data.getTestData()
     
-    # Model parameters
+    # Model parameters.
     n_questions = data.n_questions
     batch_size = 32
-    num_epochs = 5
+    num_epochs = 100
     embed_dim = 256
     num_heads = 8
     ff_dim = 512
@@ -272,11 +276,11 @@ if __name__ == '__main__':
     print(f"Transformer blocks: {num_transformer_blocks}")
     print(f"Max sequence length: {max_seq_len}")
     
-    # Set device
+    # Set device.
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Truncate sequences
+    # Truncate sequences.
     def truncate_sequence(record):
         if record['n_answers'] > max_seq_len + 1:
             return {
@@ -289,7 +293,7 @@ if __name__ == '__main__':
     train_data = [truncate_sequence(record) for record in train_data]
     test_data = [truncate_sequence(record) for record in test_data]
     
-    # Initialize model
+    # Initialize model.
     model = DKT(
         n_questions=n_questions,
         embed_dim=embed_dim,
@@ -301,7 +305,7 @@ if __name__ == '__main__':
         question_mapping=data.question_mapping
     ).to(device)
     
-    # Create DataLoader
+    # Create DataLoader.
     train_dataset = DKTDataset(train_data)
     train_loader = DataLoader(
         train_dataset,
@@ -310,7 +314,7 @@ if __name__ == '__main__':
         collate_fn=collate_fn
     )
     
-    # Initialize optimizer
+    # Initialize optimizer.
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     
     print("\nStarting training...")
@@ -345,7 +349,7 @@ if __name__ == '__main__':
             epoch_loss = total_loss / total_samples if total_samples > 0 else total_loss
             print(f"Epoch {epoch}/{num_epochs}, Loss: {epoch_loss:.4f}")
             
-            # Evaluate after each epoch
+            # Evaluate after each epoch.
             model.eval()
             with torch.no_grad():
                 auc, accuracy = evaluate_model(model, test_data)
@@ -370,7 +374,7 @@ if __name__ == '__main__':
             model.load_state_dict(best_model)
             print(f"\nTraining completed. Best AUC: {best_auc:.4f}")
             
-            # Final evaluation
+            # Final evaluation.
             model.eval()
             with torch.no_grad():
                 final_auc, final_accuracy = evaluate_model(model, test_data)
