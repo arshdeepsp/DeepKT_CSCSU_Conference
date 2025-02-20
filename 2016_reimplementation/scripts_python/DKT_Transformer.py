@@ -19,12 +19,11 @@ class TransformerBlock(nn.Module):
         self.dropout1 = nn.Dropout(dropout_rate)
         self.dropout2 = nn.Dropout(dropout_rate)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, key_padding_mask=None):
         # x: (batch, seq_len, embed_dim) -> transpose for MultiheadAttention: (seq_len, batch, embed_dim)
         x = x.transpose(0, 1)
-        # NOTE: Do NOT transpose the mask here!
-        # The causal mask from _create_causal_mask already has shape (seq_len, seq_len) in the proper orientation.
-        attn_output, _ = self.attention(x, x, x, attn_mask=mask)
+        # Use both the causal mask and key_padding_mask.
+        attn_output, _ = self.attention(x, x, x, attn_mask=mask, key_padding_mask=key_padding_mask)
         attn_output = self.dropout1(attn_output)
         out1 = self.layernorm1(x + attn_output)
         ffn_output = self.ffn(out1)
@@ -34,8 +33,8 @@ class TransformerBlock(nn.Module):
         return out2.transpose(0, 1)
 
 class DKT(nn.Module):
-    def __init__(self, n_questions, embed_dim=256, num_heads=8, ff_dim=512, 
-                 num_transformer_blocks=3, dropout_rate=0.1, max_seq_len=1000,
+    def __init__(self, n_questions, embed_dim=128, num_heads=8, ff_dim=256, 
+                 num_transformer_blocks=4, dropout_rate=0.1, max_seq_len=1000,
                  question_mapping=None):
         super(DKT, self).__init__()
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
@@ -44,11 +43,12 @@ class DKT(nn.Module):
         self.embed_dim = embed_dim
         self.question_mapping = question_mapping
 
-        # Separate embeddings for questions and correctness
-        self.question_embedding = nn.Embedding(n_questions, embed_dim // 2)
-        self.correct_embedding = nn.Embedding(2, embed_dim // 2)
+        # Reserve an extra index for padding in questions.
+        self.question_embedding = nn.Embedding(n_questions + 1, embed_dim // 2, padding_idx=n_questions)
+        # For correctness, valid values are 0 and 1; use index 2 as padding.
+        self.correct_embedding = nn.Embedding(3, embed_dim // 2, padding_idx=2)
         
-        # Pre-compute positional encodings
+        # Pre-compute positional encodings.
         self.register_buffer("pos_encoding", self._positional_encoding(max_seq_len, embed_dim))
         
         self.transformer_blocks = nn.ModuleList([
@@ -68,30 +68,29 @@ class DKT(nn.Module):
         return pos_encoding
 
     def _create_causal_mask(self, size, device):
-        # Create an upper-triangular matrix of ones, then transpose to get a lower-triangular matrix.
-        mask = (torch.triu(torch.ones(size, size, device=device)) == 1).transpose(0, 1)
-        # Allowed positions: 0.0; masked positions: -inf.
-        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        # Create a boolean mask: True for positions that should be masked (future tokens).
+        # Here, positions (i,j) with j > i are masked.
+        mask = torch.triu(torch.ones(size, size, device=device), diagonal=1).bool()
         return mask
 
-    def _process_sequence(self, questions, correctness):
+    def _process_sequence(self, questions, correctness, key_padding_mask=None):
         batch_size, seq_len = questions.shape
         device = questions.device
         
-        # Get embeddings and concatenate them.
+        # Get embeddings and concatenate.
         q_embeds = self.question_embedding(questions)
         c_embeds = self.correct_embedding(correctness)
         x = torch.cat([q_embeds, c_embeds], dim=-1)
         
-        # Add positional encoding
-        x = x + self.pos_encoding[:seq_len]
+        # Add positional encoding.
+        x = x + self.pos_encoding[:seq_len].to(device)
         
-        # Create causal mask of shape (seq_len, seq_len)
+        # Create a causal mask.
         attention_mask = self._create_causal_mask(seq_len, device)
         
-        # Process through transformer blocks
+        # Process through transformer blocks.
         for transformer in self.transformer_blocks:
-            x = transformer(x, mask=attention_mask)
+            x = transformer(x, mask=attention_mask, key_padding_mask=key_padding_mask)
         
         x = self.dropout(x)
         return self.output_layer(x)
@@ -104,16 +103,19 @@ class DKT(nn.Module):
         if n_steps < 1:
             return torch.tensor(0.0, device=device), 0
 
-        # Initialize tensors
-        questions = torch.zeros(batch_size, n_steps, dtype=torch.long, device=device)
-        correctness = torch.zeros(batch_size, n_steps, dtype=torch.long, device=device)
-        next_questions = torch.zeros(batch_size, n_steps, dtype=torch.long, device=device)
+        # Initialize tensors.
+        # For questions, use padding index (n_questions); for correctness, padding index 2.
+        questions = torch.full((batch_size, n_steps), self.n_questions, dtype=torch.long, device=device)
+        correctness = torch.full((batch_size, n_steps), 2, dtype=torch.long, device=device)
+        # For next_questions, initialize with 0 (a valid dummy index) so that padded positions won't cause indexing errors.
+        next_questions = torch.zeros((batch_size, n_steps), dtype=torch.long, device=device)
         truth = torch.zeros(batch_size, n_steps, device=device)
-        valid_mask = torch.zeros(batch_size, n_steps, device=device)
+        valid_mask = torch.zeros(batch_size, n_steps, device=device)  # 1 indicates a valid timestep.
 
         # Fill tensors with data from each record.
         for i, record in enumerate(batch):
-            for t in range(min(n_steps, record['n_answers'] - 1)):
+            valid_count = 0
+            for t in range(record['n_answers'] - 1):
                 try:
                     q_current = record['questionId'][t]
                     q_next = record['questionId'][t+1]
@@ -133,34 +135,39 @@ class DKT(nn.Module):
                     correct = int(record['correct'][t])
                     next_correct = int(record['correct'][t+1])
                     
-                    valid_mask[i, t] = 1
-                    questions[i, t] = q_current
-                    correctness[i, t] = correct
-                    next_questions[i, t] = q_next
-                    truth[i, t] = next_correct
+                    if valid_count >= n_steps:
+                        break
+                    
+                    valid_mask[i, valid_count] = 1
+                    questions[i, valid_count] = q_current
+                    correctness[i, valid_count] = correct
+                    next_questions[i, valid_count] = q_next
+                    truth[i, valid_count] = next_correct
+                    valid_count += 1
                 
                 except Exception as e:
                     continue
 
-        # Get predictions (logits) and apply sigmoid.
-        logits = self._process_sequence(questions, correctness)
-        pred_output = torch.sigmoid(logits)
+        # Build key_padding_mask for transformer: True where positions are padded.
+        key_padding_mask = (valid_mask == 0).bool()
         
+        # Get predictions (logits).
+        logits = self._process_sequence(questions, correctness, key_padding_mask=key_padding_mask)
         # Gather predictions for the "next" question.
-        pred = torch.gather(pred_output, 2, next_questions.unsqueeze(-1)).squeeze(-1)
+        pred_logits = torch.gather(logits, 2, next_questions.unsqueeze(-1)).squeeze(-1)
         
-        # Compute binary cross-entropy loss, weighted by valid_mask.
-        loss = F.binary_cross_entropy(pred, truth, reduction='none')
+        # Compute loss using BCEWithLogitsLoss on valid positions.
+        loss = F.binary_cross_entropy_with_logits(pred_logits, truth, reduction='none')
         loss = (loss * valid_mask).sum()
         total_tests = valid_mask.sum().item()
         
         return loss, total_tests
 
-    def predict(self, questions, correctness):
+    def predict(self, questions, correctness, key_padding_mask=None):
         """Make predictions for a single sequence."""
         self.eval()
         with torch.no_grad():
-            logits = self._process_sequence(questions, correctness)
+            logits = self._process_sequence(questions, correctness, key_padding_mask=key_padding_mask)
             return torch.sigmoid(logits)
 
 def evaluate_model(model, test_batch):
@@ -176,9 +183,8 @@ def evaluate_model(model, test_batch):
             if seq_len < 1:
                 continue
             
-            # Prepare sequence data.
-            questions = torch.zeros(1, seq_len, dtype=torch.long, device=device)
-            correctness = torch.zeros(1, seq_len, dtype=torch.long, device=device)
+            questions = torch.full((1, seq_len), model.n_questions, dtype=torch.long, device=device)
+            correctness = torch.full((1, seq_len), 2, dtype=torch.long, device=device)
             
             valid_pos = []
             for t in range(seq_len):
@@ -209,10 +215,9 @@ def evaluate_model(model, test_batch):
             if not valid_pos:
                 continue
             
-            # Get predictions.
+            # For evaluation, assume full validity so no key_padding_mask.
             pred_output = model.predict(questions, correctness)
             
-            # Collect predictions.
             for t, q_next, truth in valid_pos:
                 pred = pred_output[0, t, q_next].item()
                 all_preds.append(pred)
@@ -256,16 +261,16 @@ if __name__ == '__main__':
     train_data = data.getTrainData()
     test_data = data.getTestData()
     
-    # Model parameters.
+    # Updated model parameters.
     n_questions = data.n_questions
     batch_size = 32
     num_epochs = 100
-    embed_dim = 256
-    num_heads = 8
-    ff_dim = 512
-    num_transformer_blocks = 3
-    dropout_rate = 0.1
-    learning_rate = 0.001
+    embed_dim = 128              # Increased embedding dimension.
+    num_heads = 8                # embed_dim must be divisible by num_heads.
+    ff_dim = 256                 # Feed-forward network dimension.
+    num_transformer_blocks = 4   # Reduced transformer blocks.
+    dropout_rate = 0.1           # Lower dropout.
+    learning_rate = 0.0005       # Lower learning rate.
     max_seq_len = 200
     
     print(f"\nModel configuration:")
@@ -317,6 +322,9 @@ if __name__ == '__main__':
     # Initialize optimizer.
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     
+    # Add a learning rate scheduler.
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=5, verbose=True)
+    
     print("\nStarting training...")
     best_auc = 0
     best_model = None
@@ -365,6 +373,9 @@ if __name__ == '__main__':
                     if patience_counter >= patience:
                         print(f"Early stopping after {epoch} epochs")
                         break
+            
+            # Update learning rate based on epoch loss.
+            scheduler.step(epoch_loss)
     
     except KeyboardInterrupt:
         print("\nTraining interrupted by user")
