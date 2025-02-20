@@ -1,117 +1,252 @@
-import math
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score, accuracy_score
+
+from data_assist import DataAssistMatrix
+from util_exp import semi_sorted_mini_batches
 from torch.utils.data import Dataset, DataLoader
 
-class DKT(nn.Module):
-    def __init__(self, n_questions, embed_dim=256, hidden_dim=256, 
-                 num_layers=2, dropout_rate=0.1, question_mapping=None):
-        super(DKT, self).__init__()
-        
-        self.n_questions = n_questions
-        self.embed_dim = embed_dim
-        self.hidden_dim = hidden_dim
-        self.question_mapping = question_mapping
 
-        # Create separate embeddings for questions and correctness
-        self.question_embedding = nn.Embedding(n_questions, embed_dim // 2)
-        self.correct_embedding = nn.Embedding(2, embed_dim // 2)
-        
-        # LSTM layer
-        self.lstm = nn.LSTM(
-            input_size=embed_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout_rate if num_layers > 1 else 0
-        )
-        
-        # Output layer
-        self.output_layer = nn.Linear(hidden_dim, n_questions)
-        self.dropout = nn.Dropout(dropout_rate)
+class DKTCell(nn.Module):
+    """
+    Implements one time step of the DKT model.
+    Computes:
+      hidden = tanh( transfer(state) + linear_x(inputX) )
+      (optionally applies dropout)
+      pred_output = sigmoid( linear_y(hidden) )
+      pred = sum( pred_output * inputY, dim=1 )
+    And computes binary cross-entropy loss between pred and truth.
+    """
+    def __init__(self, n_input, n_hidden, n_questions, dropout_pred=False):
+        super(DKTCell, self).__init__()
+        self.n_input = n_input
+        self.n_hidden = n_hidden
+        self.n_questions = n_questions
+        self.dropout_pred = dropout_pred
+
+        self.transfer = nn.Linear(n_hidden, n_hidden)
+        self.linear_x = nn.Linear(n_input, n_hidden)
+        self.linear_y = nn.Linear(n_hidden, n_questions)
+        self.dropout = nn.Dropout() if dropout_pred else None
+
+    def forward(self, state, inputX, inputY, truth):
+        """
+        state: Tensor (batch, n_hidden)
+        inputX: Tensor (batch, n_input)
+        inputY: Tensor (batch, n_questions) – one-hot for next question.
+        truth:  Tensor (batch,) – binary correctness.
+        Returns:
+           pred: Tensor (batch,) – predicted probability (scalar per sample)
+           loss: scalar loss (sum over batch)
+           hidden: new hidden state (batch, n_hidden)
+        """
+        hidden = torch.tanh(self.transfer(state) + self.linear_x(inputX))
+        if self.dropout is not None:
+            hidden = self.dropout(hidden)
+        linY = self.linear_y(hidden)
+        pred_output = torch.sigmoid(linY)
+        # Multiply elementwise with inputY and sum over question dimension.
+        pred = torch.sum(pred_output * inputY, dim=1)
+        loss = F.binary_cross_entropy(pred, truth, reduction='sum')
+        return pred, loss, hidden
+
+
+class DKT(nn.Module):
+    """
+    Deep Knowledge Tracing model.
+    """
+    def __init__(self, n_questions, n_hidden, dropout_pred=False,
+                 compressed_sensing=False, compressed_dim=None,
+                 question_mapping=None):
+        super(DKT, self).__init__()
+        self.n_questions = n_questions
+        self.n_hidden = n_hidden
+        self.dropout_pred = dropout_pred
+        self.compressed_sensing = compressed_sensing
+        self.question_mapping = question_mapping  # e.g., { raw_qid: contiguous_index }
+
+        if self.compressed_sensing:
+            assert compressed_dim is not None, "compressed_dim must be specified"
+            self.n_input = compressed_dim
+            # Create a random projection matrix from (2*n_questions) to compressed_dim.
+            torch.manual_seed(12345)
+            # Use a non-trainable parameter for the projection basis.
+            self.basis = nn.Parameter(torch.randn(n_questions * 2, self.n_input), requires_grad=False)
+        else:
+            self.n_input = n_questions * 2
+            self.basis = None
+
+        self.cell = DKTCell(self.n_input, n_hidden, n_questions, dropout_pred)
+        self.start_layer = nn.Linear(1, n_hidden)
 
     def forward(self, batch):
+        """
+        Forward pass on a batch of student records.
+        Each record is a dict with:
+           - 'n_answers': int, number of answers
+           - 'questionId': list of raw question IDs (assumed 1-indexed, or remapped via question_mapping)
+           - 'correct': list of binary correctness (0 or 1)
+        The model runs for T = max(n_answers) - 1 time steps.
+        Returns:
+          total_loss: scalar loss (sum over time and students)
+          total_tests: total number of prediction points (for averaging)
+        """
         device = next(self.parameters()).device
         batch_size = len(batch)
         n_steps = max(record['n_answers'] for record in batch) - 1
-        
-        if n_steps < 1:
-            return torch.tensor(0.0, device=device), 0
 
-        # Initialize tensors for questions and correctness
-        questions = torch.zeros(batch_size, n_steps, dtype=torch.long, device=device)
-        correctness = torch.zeros(batch_size, n_steps, dtype=torch.long, device=device)
-        next_questions = torch.zeros(batch_size, n_steps, dtype=torch.long, device=device)
-        truth = torch.zeros(batch_size, n_steps, device=device)
-        valid_mask = torch.zeros(batch_size, n_steps, device=device)
+        # Debug print: report number of time steps for this batch.
+        print(f"[DEBUG] Processing batch of {batch_size} records with {n_steps} time steps each.")
 
-        # Fill the tensors
-        for i, record in enumerate(batch):
-            for t in range(min(n_steps, record['n_answers'] - 1)):
-                try:
-                    # Get current and next questions
-                    q_current = record['questionId'][t]
-                    q_next = record['questionId'][t+1]
-                    
-                    # Apply mapping if exists
+        state = self.start_layer(torch.zeros(batch_size, 1, device=device))
+        total_loss = 0.0
+        total_tests = 0
+
+        for t in range(n_steps):
+            # Print progress every 10 steps or on the first step.
+            if t == 0 or (t+1) % 10 == 0 or (t+1) == n_steps:
+                print(f"[DEBUG] Time step {t+1}/{n_steps}")
+
+            # Prepare input tensors.
+            inputX = torch.zeros(batch_size, self.n_questions * 2, device=device)
+            inputY = torch.zeros(batch_size, self.n_questions, device=device)
+            truth = torch.zeros(batch_size, device=device)
+            valid_mask = torch.zeros(batch_size, device=device)  # 1 if valid at time t
+
+            for i, record in enumerate(batch):
+                if t + 1 < record['n_answers']:
+                    valid_mask[i] = 1
+                    raw_q_current = record['questionId'][t]
+                    raw_q_next = record['questionId'][t+1]
                     if self.question_mapping is not None:
-                        q_current = self.question_mapping.get(q_current)
-                        q_next = self.question_mapping.get(q_next)
+                        q_current = self.question_mapping.get(raw_q_current, None)
+                        q_next = self.question_mapping.get(raw_q_next, None)
                         if q_current is None or q_next is None:
                             continue
-                    
-                    # Convert to 0-based indices
-                    q_current = int(q_current) - 1
-                    q_next = int(q_next) - 1
-                    
-                    if not (0 <= q_current < self.n_questions and 0 <= q_next < self.n_questions):
+                    else:
+                        q_current = raw_q_current
+                        q_next = raw_q_next
+                    correct_current = record['correct'][t]
+                    correct_next = record['correct'][t+1]
+                    # Compute index into inputX: (correct_current * n_questions) + (q_current - 1)
+                    idx = int(correct_current * self.n_questions + (q_current - 1))
+                    if idx < 0 or idx >= 2 * self.n_questions:
                         continue
-                    
-                    # Get correctness
-                    correct = int(record['correct'][t])
-                    next_correct = int(record['correct'][t+1])
-                    
-                    # Set values
-                    valid_mask[i, t] = 1
-                    questions[i, t] = q_current
-                    correctness[i, t] = correct
-                    next_questions[i, t] = q_next
-                    truth[i, t] = next_correct
-                
-                except Exception as e:
-                    print(f"Error processing record at position {i}, step {t}: {e}")
-                    continue
+                    inputX[i, idx] = 1
+                    inputY[i, q_next - 1] = 1
+                    truth[i] = correct_next
 
-        # Get embeddings
-        q_embeds = self.question_embedding(questions)
-        c_embeds = self.correct_embedding(correctness)
-        
-        # Combine embeddings
-        x = torch.cat([q_embeds, c_embeds], dim=-1)
-        
-        # Apply LSTM
-        x = self.dropout(x)
-        outputs, _ = self.lstm(x)
-        outputs = self.dropout(outputs)
-        
-        # Compute predictions
-        logits = self.output_layer(outputs)
-        pred_output = torch.sigmoid(logits)
-        
-        # Gather predictions for next questions
-        pred = torch.gather(pred_output, 2, next_questions.unsqueeze(-1)).squeeze(-1)
-        
-        # Compute loss
-        loss = F.binary_cross_entropy(pred, truth, reduction='none')
-        loss = (loss * valid_mask).sum()
-        total_tests = valid_mask.sum().item()
-        
-        return loss, total_tests
+            if self.compressed_sensing:
+                inputX = inputX @ self.basis
+
+            pred, loss, hidden = self.cell(state, inputX, inputY, truth)
+            state = hidden
+            total_loss += loss
+            total_tests += valid_mask.sum().item()
+
+            # Debug: report valid tests at this time step.
+            if (t+1) % 10 == 0 or (t+1) == n_steps:
+                print(f"[DEBUG] Time step {t+1}: valid test count = {int(valid_mask.sum().item())}")
+
+        return total_loss, total_tests
+
+    def get_prediction_truth(self, batch):
+        """
+        Runs the model on a batch and collects prediction–truth pairs.
+        Returns a list of dicts, each with keys 'pred' and 'truth'.
+        """
+        device = next(self.parameters()).device
+        self.eval()
+        predictions = []
+        batch_size = len(batch)
+        n_steps = max(record['n_answers'] for record in batch) - 1
+
+        # Debug print.
+        print(f"[DEBUG] Evaluating {batch_size} records for {n_steps} time steps.")
+
+        state = self.start_layer(torch.zeros(batch_size, 1, device=device))
+        with torch.no_grad():
+            for t in range(n_steps):
+                # Optional: print progress every 10 steps.
+                if t == 0 or (t+1) % 10 == 0 or (t+1) == n_steps:
+                    print(f"[DEBUG] Evaluation time step {t+1}/{n_steps}")
+
+                inputX = torch.zeros(batch_size, self.n_questions * 2, device=device)
+                inputY = torch.zeros(batch_size, self.n_questions, device=device)
+                truth_tensor = torch.zeros(batch_size, device=device)
+                valid_mask = torch.zeros(batch_size, device=device)
+
+                for i, record in enumerate(batch):
+                    if t + 1 < record['n_answers']:
+                        valid_mask[i] = 1
+                        raw_q_current = record['questionId'][t]
+                        raw_q_next = record['questionId'][t+1]
+                        if self.question_mapping is not None:
+                            q_current = self.question_mapping.get(raw_q_current, None)
+                            q_next = self.question_mapping.get(raw_q_next, None)
+                            if q_current is None or q_next is None:
+                                continue
+                        else:
+                            q_current = raw_q_current
+                            q_next = raw_q_next
+                        correct_current = record['correct'][t]
+                        correct_next = record['correct'][t+1]
+                        idx = int(correct_current * self.n_questions + (q_current - 1))
+                        if idx < 0 or idx >= 2 * self.n_questions:
+                            continue
+                        inputX[i, idx] = 1
+                        inputY[i, q_next - 1] = 1
+                        truth_tensor[i] = correct_next
+
+                if self.compressed_sensing:
+                    inputX = inputX @ self.basis
+
+                pred, _, hidden = self.cell(state, inputX, inputY, truth_tensor)
+                state = hidden
+                # For each student in the batch, if valid, record prediction and truth.
+                for i in range(batch_size):
+                    if valid_mask[i] == 1:
+                        predictions.append({'pred': pred[i].item(), 'truth': truth_tensor[i].item()})
+        return predictions
+
+
+def evaluate_model(model, test_batch):
+    """
+    Evaluates the model on test data.
+    Returns:
+      auc: Area under the ROC curve
+      accuracy: classification accuracy (threshold 0.5)
+    """
+    preds_truth = model.get_prediction_truth(test_batch)
+    if len(preds_truth) == 0:
+        return 0.0, 0.0
+    y_pred = [pt['pred'] for pt in preds_truth]
+    y_true = [pt['truth'] for pt in preds_truth]
+    try:
+        auc = roc_auc_score(y_true, y_pred)
+    except Exception as e:
+        auc = 0.0
+    y_pred_bin = [1 if p > 0.5 else 0 for p in y_pred]
+    accuracy = accuracy_score(y_true, y_pred_bin)
+    return auc, accuracy
+
+
+def get_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
+
 
 class DKTDataset(Dataset):
     def __init__(self, data):
+        """
+        data: a list of student records, each being a dictionary.
+        """
         self.data = data
 
     def __len__(self):
@@ -120,217 +255,59 @@ class DKTDataset(Dataset):
     def __getitem__(self, idx):
         return self.data[idx]
 
+
+# A collate function that just returns the batch as a list:
 def collate_fn(batch):
     return batch
 
-def evaluate_model(model, test_batch):
-    model.eval()
-    with torch.no_grad():
-        device = next(model.parameters()).device
-        batch_size = len(test_batch)
-        n_steps = max(record['n_answers'] for record in test_batch) - 1
-        
-        if n_steps < 1:
-            return 0.0, 0.0
-
-        all_preds = []
-        all_truths = []
-        
-        # Process each batch item
-        for i, record in enumerate(test_batch):
-            seq_len = min(n_steps, record['n_answers'] - 1)
-            if seq_len < 1:
-                continue
-                
-            # Create tensors for this sequence
-            questions = torch.zeros(1, seq_len, dtype=torch.long, device=device)
-            correctness = torch.zeros(1, seq_len, dtype=torch.long, device=device)
-            
-            # Fill sequence data
-            for t in range(seq_len):
-                try:
-                    q_current = record['questionId'][t]
-                    if model.question_mapping is not None:
-                        q_current = model.question_mapping.get(q_current)
-                        if q_current is None:
-                            continue
-                    
-                    q_current = int(q_current) - 1
-                    if not (0 <= q_current < model.n_questions):
-                        continue
-                        
-                    correct = int(record['correct'][t])
-                    
-                    questions[0, t] = q_current
-                    correctness[0, t] = correct
-                    
-                except Exception as e:
-                    print(f"Error in evaluation at position {i}, step {t}: {e}")
-                    continue
-            
-            # Get embeddings
-            q_embeds = model.question_embedding(questions)
-            c_embeds = model.correct_embedding(correctness)
-            x = torch.cat([q_embeds, c_embeds], dim=-1)
-            
-            # Process through LSTM
-            outputs, _ = model.lstm(x)
-            logits = model.output_layer(outputs)
-            pred_output = torch.sigmoid(logits)
-            
-            # Collect predictions for next questions
-            for t in range(seq_len):
-                q_next = record['questionId'][t+1]
-                if model.question_mapping is not None:
-                    q_next = model.question_mapping.get(q_next)
-                    if q_next is None:
-                        continue
-                        
-                q_next = int(q_next) - 1
-                if not (0 <= q_next < model.n_questions):
-                    continue
-                
-                # Get prediction for next question
-                pred = pred_output[0, t, q_next].item()
-                truth = record['correct'][t+1]
-                
-                all_preds.append(pred)
-                all_truths.append(truth)
-
-        if not all_preds:
-            return 0.0, 0.0
-
-        try:
-            auc = roc_auc_score(all_truths, all_preds)
-        except Exception as e:
-            print(f"Error calculating AUC: {e}")
-            auc = 0.0
-
-        y_pred_bin = [1 if p > 0.5 else 0 for p in all_preds]
-        accuracy = accuracy_score(all_truths, y_pred_bin)
-        
-        print(f"Number of test predictions: {len(all_preds)}")
-        print(f"Prediction range: {min(all_preds):.4f} - {max(all_preds):.4f}")
-        
-        return auc, accuracy
 
 if __name__ == '__main__':
-    from data_assist import DataAssistMatrix
-    
-    # Load data
+    # Get data.
     data = DataAssistMatrix()
     train_data = data.getTrainData()
     test_data = data.getTestData()
-    
-    # Model parameters
-    n_questions = data.n_questions
-    batch_size = 32
-    num_epochs = 30
-    embed_dim = 256
-    hidden_dim = 256
-    num_layers = 2
-    dropout_rate = 0.1
-    learning_rate = 0.001
-    max_seq_len = 200
-    
-    print(f"\nModel configuration:")
-    print(f"Number of questions: {n_questions}")
-    print(f"Embedding dimension: {embed_dim}")
-    print(f"Hidden dimension: {hidden_dim}")
-    print(f"Number of LSTM layers: {num_layers}")
-    print(f"Max sequence length: {max_seq_len}")
-    
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    # Truncate sequences
-    def truncate_sequence(record):
-        if record['n_answers'] > max_seq_len + 1:
-            return {
-                'n_answers': max_seq_len + 1,
-                'questionId': record['questionId'][:max_seq_len + 1],
-                'correct': record['correct'][:max_seq_len + 1]
-            }
-        return record
 
-    train_data = [truncate_sequence(record) for record in train_data]
-    test_data = [truncate_sequence(record) for record in test_data]
-    
-    # Initialize model
-    model = DKT(
-        n_questions=n_questions,
-        embed_dim=embed_dim,
-        hidden_dim=hidden_dim,
-        num_layers=num_layers,
-        dropout_rate=dropout_rate,
-        question_mapping=data.question_mapping
-    ).to(device)
-    
-    # Create DataLoader
-    train_dataset = DKTDataset(train_data)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate_fn
-    )
-    
-    # Initialize optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    
-    print("\nStarting training...")
-    best_auc = 0
-    best_model = None
-    patience = 10
-    patience_counter = 0
-    
-    try:
-        for epoch in range(1, num_epochs + 1):
-            model.train()
-            total_loss = 0
-            total_samples = 0
-            
-            for batch_idx, batch in enumerate(train_loader):
-                optimizer.zero_grad()
-                loss, num_samples = model(batch)
-                
-                avg_loss = loss / num_samples if num_samples > 0 else loss
-                avg_loss.backward()
-                
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                
-                total_loss += loss.item()
-                total_samples += num_samples
-                
-                if (batch_idx + 1) % 10 == 0:
-                    print(f"Epoch {epoch}, Batch {batch_idx + 1}/{len(train_loader)}, "
-                          f"Loss: {total_loss/total_samples:.4f}")
-            
-            epoch_loss = total_loss / total_samples if total_samples > 0 else total_loss
-            print(f"Epoch {epoch}/{num_epochs}, Loss: {epoch_loss:.4f}")
-            
-            # Evaluate after each epoch
-            model.eval()
-            with torch.no_grad():
-                auc, accuracy = evaluate_model(model, test_data)
-                print(f"Epoch {epoch} - Test AUC: {auc:.4f}, Accuracy: {accuracy:.4f}")
-                
-                if auc > best_auc:
-                    best_auc = auc
-                    best_model = model.state_dict()
-                    patience_counter = 0
-                    print(f"New best AUC: {best_auc:.4f}")
-                else:
-                    patience_counter += 1
-                    if patience_counter >= patience:
-                        print(f"Early stopping after {epoch} epochs")
-                        break
-    
-    except KeyboardInterrupt:
-        print("Training interrupted by user")
-    
-    finally:
-        if best_model is not None:
-            print(f"Training completed. Best AUC: {best_auc:.4f}")
+    # Define mini-batch size for training.
+    mini_batch_size = 100
+
+    # Create the model.
+    model = DKT(n_questions=data.n_questions, n_hidden=200, dropout_pred=True,
+                compressed_sensing=True, compressed_dim=100,
+                question_mapping=data.question_mapping)
+
+    device = get_device()
+    model = model.to(device)
+
+    # Use an optimizer for training.
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    num_epochs = 300
+
+    # Training loop using mini-batches with debug prints and timing.
+    for epoch in range(1, num_epochs + 1):
+        model.train()
+        total_loss = 0.0
+        total_tests = 0
+
+        batches = semi_sorted_mini_batches(train_data, mini_batch_size, trim_to_batch_size=True)
+        epoch_start_time = time.time()
+        for batch_idx, batch in enumerate(batches, 1):
+            batch_start_time = time.time()
+
+            optimizer.zero_grad()
+            loss, tests = model(batch)  # forward pass on the mini-batch
+            loss.backward()             # backward pass on the mini-batch
+            optimizer.step()            # update parameters
+
+            total_loss += loss.item()   # accumulate scalar loss value
+            total_tests += tests
+
+            batch_end_time = time.time()
+            print(f"[DEBUG] Epoch {epoch}, batch {batch_idx}/{len(batches)} processed in {batch_end_time - batch_start_time:.2f} sec, valid tests: {tests}")
+
+        epoch_end_time = time.time()
+        avg_loss = total_loss / total_tests if total_tests > 0 else total_loss
+        print(f"[DEBUG] Epoch {epoch} took {epoch_end_time - epoch_start_time:.2f} sec, Avg Loss: {avg_loss:.4f}")
+
+        # Evaluation.
+        auc, acc = evaluate_model(model, test_data)
+        print(f"Epoch {epoch}: auROC {auc:.4f}, Accuracy {acc:.4f}")
