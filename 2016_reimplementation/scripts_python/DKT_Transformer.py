@@ -1,242 +1,214 @@
-import time
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 from sklearn.metrics import roc_auc_score, accuracy_score
-
-from data_assist import DataAssistMatrix
-from util_exp import semi_sorted_mini_batches
 from torch.utils.data import Dataset, DataLoader
 
-#########################################
-# Positional Encoding (sine/cosine style)
-#########################################
+from data_assist import DataAssistMatrix
+
+###############################################################################
+# Positional Encoding
+###############################################################################
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=5000):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
-        
-        # Create constant 'pe' matrix with values dependent on 
-        # pos and i
         pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) *
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) *
                              (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         if d_model % 2 == 1:
-            # if odd, last column remains zero; alternatively you could trim
-            pe[:, 1::2] = torch.cos(position * div_term[:pe[:, 1::2].shape[1]])
+            pe[:, 1::2] = torch.cos(position * div_term[:pe[:, 1::2].size(1)])
         else:
             pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # shape: (1, max_len, d_model)
+        pe = pe.unsqueeze(1)  # (max_len, 1, d_model)
         self.register_buffer('pe', pe)
-        
+
     def forward(self, x):
-        # x shape: (batch_size, seq_len, d_model)
-        x = x + self.pe[:, :x.size(1)]
+        # x: (seq_len, batch, d_model)
+        x = x + self.pe[:x.size(0)]
         return self.dropout(x)
 
-#########################################################
-# Transformer-based Deep Knowledge Tracing Model
-#########################################################
-class DKTTransformer(nn.Module):
-    """
-    Transformer version of the Deep Knowledge Tracing (DKT) model.
-    Instead of processing one time step at a time with recurrence,
-    this model encodes an entire sequence (padded to the same length)
-    using a Transformer with 4 blocks and 4 attention heads.
-    
-    For each time step t, the input vector is constructed from the student’s
-    response at time t (a one-hot vector over 2*n_questions, or a compressed
-    version thereof) and the model predicts the correctness at time t+1.
-    
-    Args:
-      - n_questions: total number of distinct questions.
-      - n_hidden: dimension of the hidden state (also d_model for Transformer).
-      - dropout_pred: dropout rate (used both in the Transformer and in output).
-      - compressed_sensing (bool): if True, use a compressed projection for the input.
-      - compressed_dim (int): projected input dimension if compressed_sensing is True.
-      - question_mapping (dict): mapping from raw question IDs to contiguous 1-indexed IDs.
-    """
-    def __init__(self, n_questions, n_hidden, dropout_pred=False,
-                 compressed_sensing=False, compressed_dim=None,
-                 question_mapping=None):
-        super(DKTTransformer, self).__init__()
+###############################################################################
+# Helper: Generate Causal Mask
+###############################################################################
+def generate_square_subsequent_mask(sz, device):
+    mask = torch.triu(torch.full((sz, sz), float('-inf')), diagonal=1).to(device)
+    return mask
+
+###############################################################################
+# Optimized TransformerDKT Model
+###############################################################################
+class TransformerDKT(nn.Module):
+    def __init__(self, n_questions, n_hidden, interaction_embed_dim=200,
+                 n_layers=2, nhead=4, dropout=0.1, question_mapping=None):
+        super(TransformerDKT, self).__init__()
         self.n_questions = n_questions
         self.n_hidden = n_hidden
-        self.dropout_pred = dropout_pred
-        self.compressed_sensing = compressed_sensing
         self.question_mapping = question_mapping
 
-        # Determine input dimension.
-        if self.compressed_sensing:
-            assert compressed_dim is not None, "compressed_dim must be specified"
-            self.n_input = compressed_dim
-            torch.manual_seed(12345)
-            # Random projection matrix (non-trainable)
-            self.basis = nn.Parameter(torch.randn(n_questions * 2, self.n_input), requires_grad=False)
+        # Reserve a special token for padding
+        self.padding_idx = 2 * n_questions  
+        self.interaction_embedding = nn.Embedding(2 * n_questions + 1, 
+                                                  interaction_embed_dim,
+                                                  padding_idx=self.padding_idx)
+        if interaction_embed_dim != n_hidden:
+            self.embedding_projection = nn.Linear(interaction_embed_dim, n_hidden)
         else:
-            self.n_input = n_questions * 2
-            self.basis = None
+            self.embedding_projection = None
 
-        # Project the (possibly compressed) input to d_model (n_hidden)
-        self.input_proj = nn.Linear(self.n_input, n_hidden)
-        # Positional encoding (using a fixed maximum length)
-        self.positional_encoding = PositionalEncoding(d_model=n_hidden, dropout=0.1, max_len=500)
-        # Transformer encoder with 4 blocks and 4 heads.
-        encoder_layer = nn.TransformerEncoderLayer(d_model=n_hidden, nhead=4, dropout=dropout_pred, batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=4)
-        # Output layer projects the Transformer output to predictions for each question.
-        self.output_layer = nn.Linear(n_hidden, n_questions)
-
+        self.pos_encoder = PositionalEncoding(n_hidden, dropout)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=n_hidden, nhead=nhead, dropout=dropout)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.prediction_layer = nn.Linear(n_hidden, n_questions)
+    
     def forward(self, batch):
         """
-        Forward pass on a batch of student records.
-        For each record, we build a sequence of length (n_answers - 1) where:
-           - The input at time t is a one-hot (or compressed) vector indicating the student's response at t.
-           - The target (via inputY) is a one-hot vector for the next question.
-           - The truth is the correctness for the next question.
-        We pad sequences to the same length.
-        
-        Returns:
-          total_loss: scalar loss (sum over valid prediction points).
-          total_tests: total number of prediction points.
+        batch: dict with keys:
+          'input_seqs': LongTensor (batch, max_seq_len)
+          'target_questions': LongTensor (batch, max_seq_len)
+          'target_correctness': FloatTensor (batch, max_seq_len)
+          'valid_mask': BoolTensor (batch, max_seq_len)
         """
         device = next(self.parameters()).device
-        batch_size = len(batch)
-        max_steps = max(record['n_answers'] for record in batch) - 1
+        input_seqs = batch['input_seqs'].to(device)
+        target_questions = batch['target_questions'].to(device)
+        target_correctness = batch['target_correctness'].to(device)
+        valid_mask = batch['valid_mask'].to(device)
 
-        print(f"[DEBUG] Processing batch of {batch_size} records with {max_steps} time steps each.")
+        batch_size, max_len = input_seqs.shape
 
-        # Initialize padded tensors.
-        # inputX: for responses at time t, shape (batch_size, max_steps, n_questions*2)
-        inputX_tensor = torch.zeros(batch_size, max_steps, self.n_questions * 2, device=device)
-        # inputY: one-hot for next question at time t+1, shape (batch_size, max_steps, n_questions)
-        inputY_tensor = torch.zeros(batch_size, max_steps, self.n_questions, device=device)
-        # truth: binary correctness for next question.
-        truth_tensor = torch.zeros(batch_size, max_steps, device=device)
-        # valid_mask: marks valid (non-padded) time steps.
-        valid_mask = torch.zeros(batch_size, max_steps, device=device)
+        # Get embeddings and project if needed.
+        emb = self.interaction_embedding(input_seqs)  # (batch, max_len, embed_dim)
+        if self.embedding_projection is not None:
+            emb = self.embedding_projection(emb)
+        # Transformer expects (max_len, batch, n_hidden)
+        emb = emb.transpose(0, 1)
+        emb = self.pos_encoder(emb)
 
-        for i, record in enumerate(batch):
-            n_steps = record['n_answers'] - 1
-            for t in range(n_steps):
-                raw_q_current = record['questionId'][t]
-                raw_q_next = record['questionId'][t+1]
-                if self.question_mapping is not None:
-                    q_current = self.question_mapping.get(raw_q_current, None)
-                    q_next = self.question_mapping.get(raw_q_next, None)
-                    if q_current is None or q_next is None:
-                        continue
-                else:
-                    q_current = raw_q_current
-                    q_next = raw_q_next
-                correct_current = record['correct'][t]
-                correct_next = record['correct'][t+1]
-                # Compute index into input vector.
-                idx = int(correct_current * self.n_questions + (q_current - 1))
-                if idx < 0 or idx >= 2 * self.n_questions:
-                    continue
-                inputX_tensor[i, t, idx] = 1
-                inputY_tensor[i, t, q_next - 1] = 1
-                truth_tensor[i, t] = correct_next
-                valid_mask[i, t] = 1
+        # Create causal mask (same for all samples in batch).
+        causal_mask = generate_square_subsequent_mask(max_len, device)
+        # key_padding_mask: True for padded positions.
+        key_padding_mask = ~valid_mask  # shape: (batch, max_len)
 
-        # Apply compressed sensing projection if enabled.
-        if self.compressed_sensing:
-            inputX_tensor = inputX_tensor @ self.basis  # (batch, max_steps, n_input)
+        transformer_output = self.transformer_encoder(emb, mask=causal_mask, src_key_padding_mask=key_padding_mask)
+        transformer_output = transformer_output.transpose(0, 1)  # (batch, max_len, n_hidden)
 
-        # Project input to d_model.
-        x = self.input_proj(inputX_tensor)  # (batch, max_steps, n_hidden)
-        # Add positional encoding.
-        x = self.positional_encoding(x)
+        logits = self.prediction_layer(transformer_output)  # (batch, max_len, n_questions)
+        preds = torch.sigmoid(logits)
+        # For each time step, select the prediction corresponding to the target question.
+        preds_target = preds.gather(dim=2, index=target_questions.unsqueeze(-1)).squeeze(-1)  # (batch, max_len)
 
-        # Create causal (subsequent) mask so that each time step can attend only to previous ones.
-        seq_len = max_steps
-        causal_mask = torch.triu(torch.full((seq_len, seq_len), float('-inf'), device=device), diagonal=1)
-
-        # Pass the entire sequence through the Transformer.
-        transformer_out = self.transformer(x, mask=causal_mask)  # (batch, max_steps, n_hidden)
-        # Compute predictions via the output layer.
-        logits = self.output_layer(transformer_out)  # (batch, max_steps, n_questions)
-        pred_output = torch.sigmoid(logits)
-        # For each time step, sum over the question dimension weighted by inputY_tensor to get a scalar prediction.
-        pred = torch.sum(pred_output * inputY_tensor, dim=-1)  # (batch, max_steps)
-
-        # Compute loss only over valid time steps.
-        valid_pred = pred[valid_mask == 1]
-        valid_truth = truth_tensor[valid_mask == 1]
-        if valid_pred.numel() > 0:
-            loss = F.binary_cross_entropy(valid_pred, valid_truth, reduction='sum')
-        else:
-            loss = torch.tensor(0.0, device=device)
+        loss = F.binary_cross_entropy(preds_target[valid_mask],
+                                      target_correctness[valid_mask], reduction='sum')
         total_tests = valid_mask.sum().item()
-
         return loss, total_tests
 
     def get_prediction_truth(self, batch):
-        """
-        Runs the model in evaluation mode on a batch and collects prediction–truth pairs.
-        Returns a list of dicts, each with keys 'pred' and 'truth'.
-        """
+        # Similar to forward, but returns a list of prediction–truth pairs.
         device = next(self.parameters()).device
         self.eval()
-        batch_size = len(batch)
-        max_steps = max(record['n_answers'] for record in batch) - 1
-
-        print(f"[DEBUG] Evaluating {batch_size} records for {max_steps} time steps.")
-
-        inputX_tensor = torch.zeros(batch_size, max_steps, self.n_questions * 2, device=device)
-        inputY_tensor = torch.zeros(batch_size, max_steps, self.n_questions, device=device)
-        truth_tensor = torch.zeros(batch_size, max_steps, device=device)
-        valid_mask = torch.zeros(batch_size, max_steps, device=device)
-
-        for i, record in enumerate(batch):
-            n_steps = record['n_answers'] - 1
-            for t in range(n_steps):
-                raw_q_current = record['questionId'][t]
-                raw_q_next = record['questionId'][t+1]
-                if self.question_mapping is not None:
-                    q_current = self.question_mapping.get(raw_q_current, None)
-                    q_next = self.question_mapping.get(raw_q_next, None)
-                    if q_current is None or q_next is None:
-                        continue
-                else:
-                    q_current = raw_q_current
-                    q_next = raw_q_next
-                correct_current = record['correct'][t]
-                correct_next = record['correct'][t+1]
-                idx = int(correct_current * self.n_questions + (q_current - 1))
-                if idx < 0 or idx >= 2 * self.n_questions:
-                    continue
-                inputX_tensor[i, t, idx] = 1
-                inputY_tensor[i, t, q_next - 1] = 1
-                truth_tensor[i, t] = correct_next
-                valid_mask[i, t] = 1
-
-        if self.compressed_sensing:
-            inputX_tensor = inputX_tensor @ self.basis
-
-        x = self.input_proj(inputX_tensor)
-        x = self.positional_encoding(x)
-        seq_len = max_steps
-        causal_mask = torch.triu(torch.full((seq_len, seq_len), float('-inf'), device=device), diagonal=1)
-        transformer_out = self.transformer(x, mask=causal_mask)
-        logits = self.output_layer(transformer_out)
-        pred_output = torch.sigmoid(logits)
-        pred = torch.sum(pred_output * inputY_tensor, dim=-1)  # (batch, max_steps)
-
         predictions = []
-        for i in range(batch_size):
-            for t in range(max_steps):
-                if valid_mask[i, t] == 1:
-                    predictions.append({'pred': pred[i, t].item(), 'truth': truth_tensor[i, t].item()})
+        with torch.no_grad():
+            input_seqs = batch['input_seqs'].to(device)
+            target_questions = batch['target_questions'].to(device)
+            target_correctness = batch['target_correctness'].to(device)
+            valid_mask = batch['valid_mask'].to(device)
+
+            batch_size, max_len = input_seqs.shape
+            emb = self.interaction_embedding(input_seqs)
+            if self.embedding_projection is not None:
+                emb = self.embedding_projection(emb)
+            emb = emb.transpose(0, 1)
+            emb = self.pos_encoder(emb)
+            causal_mask = generate_square_subsequent_mask(max_len, device)
+            key_padding_mask = ~valid_mask
+            transformer_output = self.transformer_encoder(emb, mask=causal_mask, src_key_padding_mask=key_padding_mask)
+            transformer_output = transformer_output.transpose(0, 1)
+            logits = self.prediction_layer(transformer_output)
+            preds = torch.sigmoid(logits)
+            preds_target = preds.gather(dim=2, index=target_questions.unsqueeze(-1)).squeeze(-1)
+
+            for i in range(batch_size):
+                seq_len = valid_mask[i].sum().item()
+                for t in range(seq_len):
+                    predictions.append({'pred': preds_target[i, t].item(),
+                                        'truth': target_correctness[i, t].item()})
         return predictions
 
-#########################################
-# Evaluation and Helper Functions
-#########################################
+###############################################################################
+# Optimized Collate Function
+###############################################################################
+def collate_fn(batch, question_mapping=None, padding_idx=None):
+    """
+    Precompute padded sequences for the Transformer model.
+    Each record in the batch is expected to have keys: 'n_answers', 'questionId', 'correct'
+    """
+    input_seqs, target_questions, target_correctness = [], [], []
+    for record in batch:
+        n_answers = record['n_answers']
+        if n_answers < 2:
+            continue
+        interactions = []
+        tq = []
+        tc = []
+        for t in range(n_answers - 1):
+            raw_q_current = record['questionId'][t]
+            # Map question IDs if mapping provided.
+            if question_mapping is not None:
+                q_current = question_mapping.get(raw_q_current, None)
+                if q_current is None:
+                    continue
+            else:
+                q_current = raw_q_current
+            idx = int(2 * (q_current - 1) + record['correct'][t])
+            interactions.append(torch.tensor(idx, dtype=torch.long))
+            
+            raw_q_next = record['questionId'][t+1]
+            if question_mapping is not None:
+                q_next = question_mapping.get(raw_q_next, None)
+                if q_next is None:
+                    continue
+            else:
+                q_next = raw_q_next
+            tq.append(torch.tensor(q_next - 1, dtype=torch.long))
+            tc.append(torch.tensor(record['correct'][t+1], dtype=torch.float))
+        if len(interactions) > 0:
+            input_seqs.append(torch.stack(interactions))
+            target_questions.append(torch.stack(tq))
+            target_correctness.append(torch.stack(tc))
+    if len(input_seqs) == 0:
+        return None
+
+    # Pad sequences.
+    padded_input = pad_sequence(input_seqs, batch_first=True, padding_value=padding_idx)
+    padded_tq = pad_sequence(target_questions, batch_first=True, padding_value=0)
+    padded_tc = pad_sequence(target_correctness, batch_first=True, padding_value=-1)
+    valid_mask = (padded_tc != -1)
+    return {
+        "input_seqs": padded_input,
+        "target_questions": padded_tq,
+        "target_correctness": padded_tc,
+        "valid_mask": valid_mask
+    }
+
+###############################################################################
+# Dataset
+###############################################################################
+class DKTDataset(Dataset):
+    def __init__(self, data):
+        self.data = data
+    def __len__(self):
+        return len(self.data)
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+###############################################################################
+# Evaluation Function (unchanged)
+###############################################################################
 def evaluate_model(model, test_batch):
     preds_truth = model.get_prediction_truth(test_batch)
     if len(preds_truth) == 0:
@@ -245,89 +217,57 @@ def evaluate_model(model, test_batch):
     y_true = [pt['truth'] for pt in preds_truth]
     try:
         auc = roc_auc_score(y_true, y_pred)
-    except Exception as e:
+    except Exception:
         auc = 0.0
     y_pred_bin = [1 if p > 0.5 else 0 for p in y_pred]
     accuracy = accuracy_score(y_true, y_pred_bin)
     return auc, accuracy
 
-def get_device():
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    else:
-        return torch.device("cpu")
-
-#########################################
-# Dataset and Collate Function
-#########################################
-class DKTDataset(Dataset):
-    def __init__(self, data):
-        """
-        data: a list of student records, each being a dictionary.
-        """
-        self.data = data
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return self.data[idx]
-
-def collate_fn(batch):
-    return batch
-
-#########################################
-# Main Training Loop
-#########################################
+###############################################################################
+# Training Loop
+###############################################################################
 if __name__ == '__main__':
-    # Load data.
     data = DataAssistMatrix()
     train_data = data.getTrainData()
     test_data = data.getTestData()
 
-    # Define mini-batch size.
-    mini_batch_size = 100
-
-    # Create the Transformer-based DKT model.
-    model = DKTTransformer(n_questions=data.n_questions, n_hidden=200, dropout_pred=True,
-                           compressed_sensing=True, compressed_dim=100,
-                           question_mapping=data.question_mapping)
-
-    device = get_device()
+    batch_size = 32
+    train_dataset = DKTDataset(train_data)
+    # Pass the mapping and padding_idx to collate_fn via a lambda.
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
+                              collate_fn=lambda batch: collate_fn(batch, data.question_mapping, 2 * data.n_questions))
+    
+    model = TransformerDKT(n_questions=data.n_questions, n_hidden=200, interaction_embed_dim=200,
+                             n_layers=2, nhead=4, dropout=0.1, question_mapping=data.question_mapping)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
-
-    # Use an optimizer.
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.5, verbose=True)
     num_epochs = 300
 
-    # Training loop using mini-batches with debug prints and timing.
     for epoch in range(1, num_epochs + 1):
         model.train()
-        total_loss = 0.0
-        total_tests = 0
-
-        batches = semi_sorted_mini_batches(train_data, mini_batch_size, trim_to_batch_size=True)
-        epoch_start_time = time.time()
-        for batch_idx, batch in enumerate(batches, 1):
-            batch_start_time = time.time()
-
+        epoch_loss = 0.0
+        epoch_tests = 0
+        batch_idx = 0
+        for raw_batch in train_loader:
+            if raw_batch is None:
+                continue
             optimizer.zero_grad()
-            loss, tests = model(batch)  # forward pass on the mini-batch
-            loss.backward()             # backward pass on the mini-batch
-            optimizer.step()            # update parameters
+            loss, tests = model(raw_batch)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            epoch_tests += tests
+            batch_idx += 1
+            batch_loss = loss.item() / tests if tests > 0 else loss.item()
+            print(f"Epoch {epoch}, Batch {batch_idx}: Loss = {batch_loss:.4f}")
+        avg_loss = epoch_loss / epoch_tests if epoch_tests > 0 else epoch_loss
+        print(f"Epoch {epoch}: Avg Loss = {avg_loss:.4f}")
+        scheduler.step(avg_loss)
 
-            total_loss += loss.item()   # accumulate scalar loss value
-            total_tests += tests
-
-            batch_end_time = time.time()
-            print(f"[DEBUG] Epoch {epoch}, batch {batch_idx}/{len(batches)} processed in {batch_end_time - batch_start_time:.2f} sec, valid tests: {tests}")
-
-        epoch_end_time = time.time()
-        avg_loss = total_loss / total_tests if total_tests > 0 else total_loss
-        print(f"[DEBUG] Epoch {epoch} took {epoch_end_time - epoch_start_time:.2f} sec, Avg Loss: {avg_loss:.4f}")
-
-        # Evaluation on test data.
-        auc, acc = evaluate_model(model, test_data)
-        print(f"Epoch {epoch}: auROC {auc:.4f}, Accuracy {acc:.4f}")
+        # Prepare test batch similarly.
+        test_batch = collate_fn(test_data, data.question_mapping, 2 * data.n_questions)
+        auc, acc = evaluate_model(model, test_batch)
+        print(f"Epoch {epoch}: auROC = {auc:.4f}, Accuracy = {acc:.4f}")
