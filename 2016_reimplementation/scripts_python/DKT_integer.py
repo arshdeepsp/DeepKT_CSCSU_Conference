@@ -3,52 +3,31 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score, accuracy_score
 from torch.utils.data import Dataset, DataLoader
-import time
-import datetime
 
 from data_assist import DataAssistMatrix
 
 ###############################################################################
-# Utility Functions for Timing and Model Info
+# DKTCell: Implements one time step of the DKT model.
 ###############################################################################
-def count_parameters(model):
-    """Count the number of trainable parameters in a model."""
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-def format_time(seconds):
-    """Format time in seconds to a readable string."""
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
-
-###############################################################################
-# Improved DKTCell
-###############################################################################
-class ImprovedDKTCell(nn.Module):
-    def __init__(self, n_input, n_hidden, n_questions, dropout_pred=True):
-        super(ImprovedDKTCell, self).__init__()
+class DKTCell(nn.Module):
+    def __init__(self, n_input, n_hidden, n_questions, dropout_pred=False):
+        """
+        Args:
+          n_input: dimension of the input (after embedding)
+          n_hidden: hidden state dimension
+          n_questions: total number of distinct questions
+          dropout_pred: whether to apply dropout before prediction
+        """
+        super(DKTCell, self).__init__()
         self.n_input = n_input
         self.n_hidden = n_hidden
         self.n_questions = n_questions
+        self.dropout_pred = dropout_pred
 
-        # Separate linear transformations for state and input
-        self.state_transform = nn.Linear(n_hidden, n_hidden)
-        self.input_transform = nn.Linear(n_input, n_hidden)
-        
-        # Additional hidden layers for increased model capacity
-        self.hidden_layer = nn.Sequential(
-            nn.ReLU(),
-            nn.Linear(n_hidden, n_hidden),
-            nn.ReLU(),
-            nn.Dropout(0.5)
-        )
-        
-        # Prediction head with optional dropout
-        pred_layers = []
-        if dropout_pred:
-            pred_layers.append(nn.Dropout(0.5))
-        pred_layers.append(nn.Linear(n_hidden, n_questions))
-        self.prediction_layer = nn.Sequential(*pred_layers)
+        self.transfer = nn.Linear(n_hidden, n_hidden)
+        self.linear_x = nn.Linear(n_input, n_hidden)
+        self.linear_y = nn.Linear(n_hidden, n_questions)
+        self.dropout = nn.Dropout() if dropout_pred else None
 
     def forward(self, state, inputX, inputY, truth):
         """
@@ -62,19 +41,11 @@ class ImprovedDKTCell(nn.Module):
           loss: scalar loss (sum over batch)
           hidden: new hidden state (batch, n_hidden)
         """
-        # Process state and input separately
-        state_feat = self.state_transform(state)
-        input_feat = self.input_transform(inputX)
-        
-        # Combine features
-        combined = torch.tanh(state_feat + input_feat)
-        
-        # Apply additional processing through hidden layers
-        hidden = self.hidden_layer(combined)
-        
-        # Generate predictions
-        logits = self.prediction_layer(hidden)
-        pred_output = torch.sigmoid(logits)
+        hidden = torch.tanh(self.transfer(state) + self.linear_x(inputX))
+        if self.dropout is not None:
+            hidden = self.dropout(hidden)
+        linY = self.linear_y(hidden)
+        pred_output = torch.sigmoid(linY)
         
         # Debug info
         if torch.isnan(pred_output).any() or torch.isinf(pred_output).any():
@@ -84,7 +55,6 @@ class ImprovedDKTCell(nn.Module):
         # Find the next question for each student in the batch
         # This assumes inputY is a one-hot encoding with exactly one 1 per row
         batch_indices = torch.arange(inputY.size(0), device=inputY.device)
-        
         # Check if we have valid next questions
         row_sums = inputY.sum(dim=1)
         valid_rows = row_sums > 0  # Identify rows with at least one question marked
@@ -120,20 +90,32 @@ class ImprovedDKTCell(nn.Module):
         return pred, loss, hidden
 
 ###############################################################################
-# Improved DKT
+# DKT: Deep Knowledge Tracing model using direct integer encoding.
 ###############################################################################
-class ImprovedDKT(nn.Module):
+class DKT(nn.Module):
     def __init__(self, n_questions, n_hidden, interaction_embed_dim=200,
-                 dropout_pred=True, question_mapping=None):
-        super(ImprovedDKT, self).__init__()
+                 dropout_pred=False, question_mapping=None):
+        """
+        Args:
+          n_questions: int, total number of distinct questions (after mapping)
+          n_hidden: int, hidden state dimension
+          interaction_embed_dim: int, dimension of the interaction embedding
+          dropout_pred: bool, whether to apply dropout before prediction
+          question_mapping: dict mapping raw question IDs to contiguous 1-indexed IDs.
+        """
+        super(DKT, self).__init__()
         self.n_questions = n_questions
         self.n_hidden = n_hidden
+        self.dropout_pred = dropout_pred
         self.question_mapping = question_mapping
 
+        # We now directly encode interactions as integers in the range [0, 2*n_questions - 1]
+        # and embed them into a dense vector.
         self.input_dim = interaction_embed_dim
         self.interaction_embedding = nn.Embedding(2 * n_questions, self.input_dim)
-        self.embedding_dropout = nn.Dropout(0.5)
-        self.cell = ImprovedDKTCell(self.input_dim, n_hidden, n_questions, dropout_pred)
+
+        # Create the cell with input dimension = interaction embedding dimension.
+        self.cell = DKTCell(self.input_dim, n_hidden, n_questions, dropout_pred)
         self.start_layer = nn.Linear(1, n_hidden)
 
     def forward(self, batch):
@@ -215,7 +197,6 @@ class ImprovedDKT(nn.Module):
 
             # Embed the integer indices into dense vectors
             x = self.interaction_embedding(inputX_int)  # shape: (batch, input_dim)
-            x = self.embedding_dropout(x)
             
             # Process only valid samples
             valid_indices = torch.nonzero(valid_mask).squeeze(-1)
@@ -321,15 +302,11 @@ class ImprovedDKT(nn.Module):
             if valid_count == 0:
                 continue
 
-            # Embed the vectors
-            x = self.interaction_embedding(inputX_int)
-            x = self.embedding_dropout(x)
-
             # Process only valid samples
             valid_indices = torch.nonzero(valid_mask).squeeze(-1)
             if valid_indices.numel() > 0:
                 try:
-                    x_valid = x[valid_indices]
+                    x_valid = self.interaction_embedding(inputX_int[valid_indices])
                     inputY_valid = inputY[valid_indices]
                     truth_valid = truth_tensor[valid_indices]
                     state_valid = state[valid_indices]
@@ -429,15 +406,31 @@ def collate_fn(batch):
     return batch
 
 ###############################################################################
-# Training Loop with Lowered Learning Rate and Scheduler
+# Utility Functions for Timing and Model Info
+###############################################################################
+def count_parameters(model):
+    """Count the number of trainable parameters in a model."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def format_time(seconds):
+    """Format time in seconds to a readable string."""
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
+
+###############################################################################
+# Training Loop (using mini-batches with batch-by-batch loss output)
 ###############################################################################
 if __name__ == '__main__':
+    import time
+    import datetime
+    
     # Record start time
     start_time = time.time()
     
     # Print header
     print("="*50)
-    print(f" ImprovedDKT Model Training - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f" DKT Model Training - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*50)
     
     # Load data.
@@ -457,9 +450,9 @@ if __name__ == '__main__':
     data_loading_time = time.time() - start_time
     print(f"Data loading completed in {data_loading_time:.2f} seconds")
 
-    # Create the improved DKT model.
-    model = ImprovedDKT(n_questions=data.n_questions, n_hidden=200, interaction_embed_dim=200,
-                        dropout_pred=True, question_mapping=data.question_mapping)
+    # Create the DKT model.
+    model = DKT(n_questions=data.n_questions, n_hidden=200, interaction_embed_dim=200,
+                dropout_pred=True, question_mapping=data.question_mapping)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     
@@ -469,8 +462,8 @@ if __name__ == '__main__':
     print(f"Model parameters: questions={data.n_questions}, hidden_dim=200")
     print(f"Total trainable parameters: {num_params:,} ({num_params/1e6:.2f}M)")
 
-    # Lower the learning rate from 0.01 to 0.001 for stability
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    # Use a smaller learning rate for stability
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-5)
     num_epochs = 300
     
     # For early stopping
@@ -548,7 +541,7 @@ if __name__ == '__main__':
                 best_auc = auc
                 patience_counter = 0
                 # Save best model
-                torch.save(model.state_dict(), 'best_improved_dkt_model.pt')
+                torch.save(model.state_dict(), 'best_dkt_model.pt')
                 print(f"New best model saved with auROC = {auc:.4f}")
             else:
                 patience_counter += 1
@@ -572,7 +565,7 @@ if __name__ == '__main__':
     
     # Load best model for final evaluation
     try:
-        model.load_state_dict(torch.load('best_improved_dkt_model.pt'))
+        model.load_state_dict(torch.load('best_dkt_model.pt'))
         final_auc, final_acc = evaluate_model(model, test_data)
         print(f"Final model performance: auROC = {final_auc:.4f}, Accuracy = {final_acc:.4f}")
     except Exception as e:
@@ -580,3 +573,8 @@ if __name__ == '__main__':
         print("Using last model for final evaluation")
         final_auc, final_acc = evaluate_model(model, test_data)
         print(f"Final model performance: auROC = {final_auc:.4f}, Accuracy = {final_acc:.4f}")
+        
+        # Early stopping if needed
+        # if avg_loss < early_stopping_threshold:
+        #     print(f"Early stopping at epoch {epoch}")
+        #     break
